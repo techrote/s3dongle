@@ -1,6 +1,6 @@
 # Upstream provenance
 
-Vendored directory: `firmware/components/tinyusb_dongle`
+Vendored directory (relative to `BLE/`): `firmware/components/tinyusb_dongle`
 
 - Repository: https://github.com/espressif/esp-iot-solution
 - Commit: 4962410c80a51cd5822da1d8d2041eb4285265f1

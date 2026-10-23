@@ -1,6 +1,6 @@
-firmware/build/
-firmware/managed_components/
-firmware/sdkconfig
-firmware/sdkconfig.old
-backups/
+# Local artifacts from the original root-level BLE build (before reorganization).
+/firmware/build/
+/firmware/managed_components/
+/firmware/sdkconfig
+/firmware/sdkconfig.old
 __pycache__/

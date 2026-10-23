@@ -1,5 +1,8 @@
 # Validation — 23 October 2026
 
+Project files now live under `BLE/`. Paths below are relative to that folder.
+Captured build/flash logs retain their original paths as historical evidence.
+
 ## Result
 
 Firmware built and flashed successfully. The board enumerates as a USB Bluetooth
