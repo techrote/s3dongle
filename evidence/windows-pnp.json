@@ -1,0 +1,23 @@
+[
+  {
+    "Name": "Generic Bluetooth Adapter",
+    "InstanceId": "USB\\VID_303A&PID_4080\\1C2904BECC48",
+    "Status": "Error",
+    "Class": "Bluetooth",
+    "Service": "BTHUSB",
+    "ProblemCode": 10,
+    "ProblemStatus": 3221225630,
+    "HardwareIds": [
+      "USB\\VID_303A&PID_4080&REV_0100",
+      "USB\\VID_303A&PID_4080"
+    ],
+    "CompatibleIds": [
+      "USB\\COMPAT_VID_303A&Class_E0&SubClass_01&Prot_01",
+      "USB\\COMPAT_VID_303A&Class_E0&SubClass_01",
+      "USB\\COMPAT_VID_303A&Class_E0",
+      "USB\\Class_E0&SubClass_01&Prot_01",
+      "USB\\Class_E0&SubClass_01",
+      "USB\\Class_E0"
+    ]
+  }
+]
