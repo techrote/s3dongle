@@ -1,266 +1,224 @@
 /*
  * SPDX-FileCopyrightText: 2020-2024 Espressif Systems (Shanghai) CO LTD
- *
  * SPDX-License-Identifier: Apache-2.0
+ * WIP Windows POC: separate USB/VHCI callbacks with copied, queued packets.
+ * No fabricated HCI command responses or Classic Bluetooth emulation.
  */
-
+#include <string.h>
+#include <stddef.h>
+#include "esp_check.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "esp_bt.h"
-
 #include "tinyusb.h"
 #include "tusb_bth.h"
 
-static const char *TAG = "tusb_bth";
+#define ACL_PAYLOAD_MAX 1021
+#define PACKET_MAX (1 + 4 + ACL_PAYLOAD_MAX)
+#define QUEUE_DEPTH 12
+#define IO_TIMEOUT_MS 3000
+typedef struct {
+    uint16_t len; // Includes H4 type byte; USB transfers omit it.
+    uint8_t reserved; // data + 1 (USB payload) must be 4-byte aligned for DMA.
+    uint8_t data[PACKET_MAX];
+} hci_packet_t;
+_Static_assert((offsetof(hci_packet_t, data) + 1) % 4 == 0, "USB DMA alignment");
+static const char *TAG = "bth_poc";
+static QueueHandle_t to_usb, to_controller;
+static SemaphoreHandle_t usb_done;
+static TaskHandle_t usb_worker, controller_worker;
+static hci_packet_t acl_partial;
+static size_t acl_expected;
 
-static SemaphoreHandle_t evt_sem = NULL;
-static SemaphoreHandle_t acl_sem = NULL;
-
-static acl_data_t acl_tx_data = {
-    .is_new_pkt = true,
-    .pkt_total_len = 0,
-    .pkt_cur_offset = 0,
-    .pkt_val = NULL
-};
-
-/*
- * @brief: BT controller callback function, used to notify the upper layer that
- *         controller is ready to receive command
- */
-static void controller_rcv_pkt_ready(void)
+// Reset also stops USB DMA. Never silently lose credits or recycle an in-flight buffer.
+static void transport_fault(const char *reason)
 {
-    // Do nothing, will check by esp_vhci_host_check_send_available().
+    ESP_LOGE(TAG, "WIP transport reset: %s", reason);
+    esp_restart();
 }
+static void enqueue(QueueHandle_t queue, const hci_packet_t *packet)
+{
+    if (xQueueSend(queue, packet, 0) != pdTRUE) {
+        transport_fault("packet queue full");
+    }
+}
+static void controller_rcv_pkt_ready(void) {}
 
-/*
- * @brief: BT controller callback function, to transfer data packet to upper
- *         controller is ready to receive command
- */
 static int host_rcv_pkt(uint8_t *data, uint16_t len)
 {
-    uint16_t act_len = len - 1;
-    uint8_t type = data[0];
-    uint8_t * acl_rx_buf = NULL;
-    uint8_t * evt_rx_buf = NULL;
-
-    HCI_DUMP_BUFFER("Recv Pkt", data, len);
-
-    switch (type) {
-    case HCIT_TYPE_COMMAND:
-        break;
-    case HCIT_TYPE_ACL_DATA:
-        acl_rx_buf = (uint8_t *)malloc(act_len * sizeof(uint8_t));
-        assert(acl_rx_buf);
-
-        memcpy(acl_rx_buf, data + 1, act_len);
-        tud_bt_acl_data_send(acl_rx_buf, act_len);
-
-        xSemaphoreTake(acl_sem, portMAX_DELAY);
-        free(acl_rx_buf);
-        break;
-    case HCIT_TYPE_SCO_DATA:
-        break;
-    case HCIT_TYPE_EVENT:
-        evt_rx_buf = (uint8_t *)malloc(act_len * sizeof(uint8_t));
-        assert(evt_rx_buf);
-
-        memcpy(evt_rx_buf, data + 1, act_len);
-        tud_bt_event_send(evt_rx_buf, act_len);
-
-        xSemaphoreTake(evt_sem, portMAX_DELAY);
-        free(evt_rx_buf);
-        break;
-    default:
-        ESP_LOGE(TAG, "Unknown type [0x%02x]", type);
-        break;
+    if (!data || len < 3 || len > PACKET_MAX) {
+        transport_fault("invalid controller packet length");
+        return 0;
     }
-
+    if (data[0] == HCIT_TYPE_EVENT) {
+        if (len != (uint16_t)(3 + data[2])) {
+            transport_fault("invalid event length");
+            return 0;
+        }
+        // Opcode/status only; never log keys, addresses or packet payloads.
+        if (data[1] == 0x0e && len >= 7) {
+            ESP_LOGI(TAG, "HCI complete opcode=%04x status=%02x",
+                     data[4] | (data[5] << 8), data[6]);
+        } else if (data[1] == 0x0f && len == 7) {
+            ESP_LOGI(TAG, "HCI status opcode=%04x status=%02x",
+                     data[5] | (data[6] << 8), data[3]);
+        }
+    } else if (data[0] == HCIT_TYPE_ACL_DATA) {
+        if (len < 5 || (size_t)len != 5u + (data[3] | (data[4] << 8))) {
+            transport_fault("invalid controller ACL length");
+            return 0;
+        }
+    } else {
+        transport_fault("unsupported controller packet type");
+        return 0;
+    }
+    hci_packet_t packet = { .len = len };
+    memcpy(packet.data, data, len);
+    enqueue(to_usb, &packet); // Copy and return; never wait for USB here.
     return 0;
 }
 
-//--------------------------------------------------------------------+
-// tinyusb callbacks
-//--------------------------------------------------------------------+
-
-// Invoked when HCI command was received over USB from Bluetooth host.
-// Detailed format is described in Bluetooth core specification Vol 2,
-// Part E, 5.4.1.
-// Length of the command is from 3 bytes (2 bytes for OpCode,
-// 1 byte for parameter total length) to 258.
-void tud_bt_hci_cmd_cb(void * hci_cmd, size_t cmd_len)
+void tud_bt_hci_cmd_cb(void *hci_cmd, size_t cmd_len)
 {
-    uint8_t * cmd_tx_buf = (uint8_t *)malloc((cmd_len + 1) * sizeof(uint8_t));
-
-    assert(cmd_tx_buf);
-
-    cmd_tx_buf[0] = HCIT_TYPE_COMMAND;
-    memcpy(cmd_tx_buf + 1, hci_cmd, cmd_len);
-
-    HCI_DUMP_BUFFER("Transmit Pkt", cmd_tx_buf, cmd_len + 1);
-
-    while (!esp_vhci_host_check_send_available()) {
-        vTaskDelay(1);
+    const uint8_t *cmd = hci_cmd;
+    if (!cmd || cmd_len < 3 || cmd_len > 258 || cmd_len != (size_t)(3 + cmd[2])) {
+        transport_fault("invalid host command length");
+        return;
     }
-    esp_vhci_host_send_packet(cmd_tx_buf, cmd_len + 1);
-
-    free(cmd_tx_buf);
-    cmd_tx_buf = NULL;
+    hci_packet_t packet = { .len = cmd_len + 1, .data = { HCIT_TYPE_COMMAND } };
+    memcpy(packet.data + 1, cmd, cmd_len);
+    ESP_LOGI(TAG, "HCI command opcode=%04x bytes=%u", cmd[0] | (cmd[1] << 8), (unsigned)cmd_len);
+    // Return so TinyUSB can process the control status stage and IN completions.
+    enqueue(to_controller, &packet);
 }
 
-// Invoked when ACL data was received over USB from Bluetooth host.
-// Detailed format is described in Bluetooth core specification Vol 2,
-// Part E, 5.4.2.
-// Length is from 4 bytes, (12 bits for Handle, 4 bits for flags
-// and 16 bits for data total length) to endpoint size.
 void tud_bt_acl_data_received_cb(void *acl_data, uint16_t data_len)
 {
-    if (acl_tx_data.is_new_pkt) {
-        acl_tx_data.pkt_total_len = *(((uint16_t *)acl_data) + 1) + 4;
-        acl_tx_data.pkt_cur_offset = 0;
-
-        acl_tx_data.pkt_val = (uint8_t *)malloc((acl_tx_data.pkt_total_len + 1) * sizeof(uint8_t));
-        assert(acl_tx_data.pkt_val);
-        memset(acl_tx_data.pkt_val, 0x0, (acl_tx_data.pkt_total_len + 1));
-
-        acl_tx_data.pkt_val[0] = HCIT_TYPE_ACL_DATA;
-        acl_tx_data.pkt_cur_offset++;
-        memcpy(acl_tx_data.pkt_val + acl_tx_data.pkt_cur_offset, acl_data, data_len);
-        acl_tx_data.pkt_cur_offset += data_len;
-
-        if (data_len < acl_tx_data.pkt_total_len) {
-            acl_tx_data.is_new_pkt = false;
+    const uint8_t *data = acl_data;
+    if (!data || !data_len) {
+        transport_fault("empty ACL fragment");
+        return;
+    }
+    if (!acl_expected) {
+        // The first full-speed USB transaction contains the four-byte HCI header.
+        if (data_len < 4) {
+            transport_fault("short ACL header");
             return;
         }
-
-        while (!esp_vhci_host_check_send_available()) {
-            vTaskDelay(1);
-        }
-
-        HCI_DUMP_BUFFER("Transmit Pkt", acl_tx_data.pkt_val, data_len + 1);
-        esp_vhci_host_send_packet(acl_tx_data.pkt_val, data_len + 1);
-        goto reset_params;
-    } else {
-        memcpy(acl_tx_data.pkt_val + acl_tx_data.pkt_cur_offset, acl_data, data_len);
-        acl_tx_data.pkt_cur_offset += data_len;
-
-        if ((acl_tx_data.pkt_cur_offset - 1) == acl_tx_data.pkt_total_len) {
-            while (!esp_vhci_host_check_send_available()) {
-                vTaskDelay(1);
-            }
-
-            HCI_DUMP_BUFFER("Transmit Pkt", acl_tx_data.pkt_val, acl_tx_data.pkt_total_len + 1);
-            esp_vhci_host_send_packet(acl_tx_data.pkt_val, acl_tx_data.pkt_total_len + 1);
-            goto reset_params;
-        }
+        acl_expected = 5 + (data[2] | (data[3] << 8));
+        acl_partial.len = 1;
+        acl_partial.data[0] = HCIT_TYPE_ACL_DATA;
     }
-
-    return;
-
-reset_params:
-
-    acl_tx_data.is_new_pkt = true;
-    acl_tx_data.pkt_total_len = 0;
-    acl_tx_data.pkt_cur_offset = 0;
-
-    if (acl_tx_data.pkt_val) {
-        free(acl_tx_data.pkt_val);
-        acl_tx_data.pkt_val = NULL;
+    if (acl_expected > PACKET_MAX || (size_t)acl_partial.len + data_len > acl_expected) {
+        acl_expected = 0;
+        acl_partial.len = 0;
+        transport_fault("ACL fragment exceeds packet boundary");
+        return;
     }
-
-    return;
+    memcpy(acl_partial.data + acl_partial.len, data, data_len);
+    acl_partial.len += data_len;
+    if (acl_partial.len == acl_expected) {
+        enqueue(to_controller, &acl_partial);
+        acl_expected = 0;
+        acl_partial.len = 0;
+    }
 }
 
-// Called when event sent with tud_bt_event_send() was delivered to BT stack.
-// Controller can release/reuse buffer with Event packet at this point.
 void tud_bt_event_sent_cb(uint16_t sent_bytes)
 {
-    if (evt_sem) {
-        xSemaphoreGive(evt_sem);
-    }
+    (void)sent_bytes;
+    xSemaphoreGive(usb_done);
 }
-
-// Called when ACL data that was sent with tud_bt_acl_data_send()
-// was delivered to BT stack.
-// Controller can release/reuse buffer with ACL packet at this point.
 void tud_bt_acl_data_sent_cb(uint16_t sent_bytes)
 {
-    if (acl_sem) {
-        xSemaphoreGive(acl_sem);
-    }
+    (void)sent_bytes;
+    xSemaphoreGive(usb_done);
 }
 
+static void send_to_controller(hci_packet_t *packet)
+{
+    TickType_t started = xTaskGetTickCount();
+    while (!esp_vhci_host_check_send_available()) {
+        if ((TickType_t)(xTaskGetTickCount() - started) >= pdMS_TO_TICKS(IO_TIMEOUT_MS)) {
+            transport_fault("controller not accepting packets");
+            return;
+        }
+        vTaskDelay(1);
+    }
+    esp_vhci_host_send_packet(packet->data, packet->len);
+}
+static void send_to_usb(hci_packet_t *packet)
+{
+    // One outstanding transfer across event/ACL endpoints; keep the worker buffer
+    // alive until completion, including TinyUSB's optional ACL zero-length packet.
+    TickType_t started = xTaskGetTickCount();
+    while (true) {
+        bool sent = false;
+        if (tud_mounted()) {
+            sent = packet->data[0] == HCIT_TYPE_EVENT
+                ? tud_bt_event_send(packet->data + 1, packet->len - 1)
+                : tud_bt_acl_data_send(packet->data + 1, packet->len - 1);
+        }
+        if (sent) {
+            break;
+        }
+        if ((TickType_t)(xTaskGetTickCount() - started) >= pdMS_TO_TICKS(IO_TIMEOUT_MS)) {
+            transport_fault("USB not mounted or endpoint busy");
+            return;
+        }
+        vTaskDelay(1);
+    }
+    if (xSemaphoreTake(usb_done, pdMS_TO_TICKS(IO_TIMEOUT_MS)) != pdTRUE) {
+        transport_fault("USB completion timeout");
+    }
+}
+static void controller_task(void *arg)
+{
+    (void)arg;
+    hci_packet_t packet;
+    for (;;) {
+        if (xQueueReceive(to_controller, &packet, portMAX_DELAY) == pdTRUE) {
+            send_to_controller(&packet);
+        }
+    }
+}
+static void usb_task(void *arg)
+{
+    (void)arg;
+    // Internal task stack on S3: PSRAM task stacks and USB D-cache are disabled.
+    hci_packet_t packet __attribute__((aligned(4)));
+    for (;;) {
+        if (xQueueReceive(to_usb, &packet, portMAX_DELAY) == pdTRUE) {
+            send_to_usb(&packet);
+        }
+    }
+}
 static esp_vhci_host_callback_t vhci_host_cb = {
-    controller_rcv_pkt_ready,
-    host_rcv_pkt
+    controller_rcv_pkt_ready, host_rcv_pkt
 };
-
-/**
- * @brief Initialize BTH Device.
- */
 void tusb_bth_init(void)
 {
-    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-
-    if (esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT) != ESP_OK) {
-        ESP_LOGE(TAG, "Bluetooth controller release classic bt memory failed.");
-        return;
-    }
-
-    if (esp_bt_controller_init(&bt_cfg) != ESP_OK) {
-        ESP_LOGE(TAG, "Bluetooth controller initialize failed.");
-        return;
-    }
-
-    if (esp_bt_controller_enable(ESP_BT_MODE_BLE) != ESP_OK) {
-        ESP_LOGE(TAG, "Bluetooth controller enable failed.");
-        return;
-    }
-
-    evt_sem = xSemaphoreCreateBinary();
-    assert(evt_sem);
-    acl_sem = xSemaphoreCreateBinary();
-    assert(acl_sem);
-
-    acl_tx_data.is_new_pkt = true;
-    acl_tx_data.pkt_total_len = 0;
-    acl_tx_data.pkt_cur_offset = 0;
-    acl_tx_data.pkt_val = NULL;
-
-    esp_vhci_host_register_callback(&vhci_host_cb);
+    to_usb = xQueueCreate(QUEUE_DEPTH, sizeof(hci_packet_t));
+    to_controller = xQueueCreate(QUEUE_DEPTH, sizeof(hci_packet_t));
+    usb_done = xSemaphoreCreateBinary();
+    ESP_ERROR_CHECK(to_usb && to_controller && usb_done ? ESP_OK : ESP_ERR_NO_MEM);
+    ESP_ERROR_CHECK(xTaskCreate(controller_task, "hci_to_ctrl", 4096, NULL, 5,
+                               &controller_worker) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    ESP_ERROR_CHECK(xTaskCreate(usb_task, "hci_to_usb", 4096, NULL, 5,
+                               &usb_worker) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    esp_bt_controller_config_t cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
+    ESP_ERROR_CHECK(esp_bt_controller_init(&cfg));
+    ESP_ERROR_CHECK(esp_bt_controller_enable(ESP_BT_MODE_BLE));
+    ESP_ERROR_CHECK(esp_vhci_host_register_callback(&vhci_host_cb));
+    ESP_LOGW(TAG, "WIP Windows startup POC: BLE only; not hardware validated");
 }
-
-/**
- * @brief Deinitialization BTH Device.
- */
 void tusb_bth_deinit(void)
 {
-    if (esp_bt_controller_disable() != ESP_OK) {
-        ESP_LOGE(TAG, "Bluetooth controller disable failed.");
-        return;
-    }
-
-    if (esp_bt_controller_deinit() != ESP_OK) {
-        ESP_LOGE(TAG, "Bluetooth controller deinit failed.");
-        return;
-    }
-
-    if (evt_sem) {
-        vSemaphoreDelete(evt_sem);
-        evt_sem = NULL;
-    }
-
-    if (acl_sem) {
-        vSemaphoreDelete(acl_sem);
-        acl_sem = NULL;
-    }
-
-    acl_tx_data.is_new_pkt = true;
-    acl_tx_data.pkt_total_len = 0;
-    acl_tx_data.pkt_cur_offset = 0;
-
-    if (acl_tx_data.pkt_val) {
-        free(acl_tx_data.pkt_val);
-        acl_tx_data.pkt_val = NULL;
-    }
+    // Reset prevents USB DMA from outliving buffers. No live uninstall in this POC.
+    esp_restart();
 }

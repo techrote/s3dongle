@@ -1,8 +1,11 @@
-# S3 BLE USB Dongle
+# S3 BLE USB Dongle — WIP Windows POC
 
-**Current result:** built and flashed on 23 October 2026. Windows detects the USB
-Bluetooth device but its native driver fails to start (Code 10). Linux operation
-has not been tested. This is experimental firmware, not a verified Windows dongle.
+**WIP, 24 October 2026:** this source contains candidate fixes for the Windows Code 10
+startup failure. It has not been flashed or tested on Windows. A successful build or
+host test does not establish Windows compatibility. The last hardware-tested firmware
+(23 October) still failed with Code 10. Linux operation is also unverified.
+
+See the [Code 10 investigation and test plan](docs/WINDOWS_CODE10_WIP.md).
 
 ESP32-S3 firmware exposing its built-in BLE controller through standard USB Bluetooth HCI
 (TinyUSB BTH). The PC runs the Bluetooth host stack. Native USB uses GPIO19 (D-) and
@@ -24,15 +27,17 @@ pinned by `firmware/dependencies.lock`. In an activated ESP-IDF shell:
 
 ```powershell
 idf.py -C firmware build
-idf.py -C firmware -p COM13 flash
 ```
 
 On the development PC, `./tools/build.ps1` activates the existing installation.
 `./tools/flash.ps1 -Port COM13` uses Python esptool and the generated flash arguments.
 After flashing, the COM port is expected to disappear because USB now exposes Bluetooth.
 
-The exact build tested is also saved as `evidence/s3dongle-merged.bin`. From ROM
-download mode it can be flashed without ESP-IDF:
+The old, hardware-tested build is saved as `evidence/s3dongle-merged.bin`.
+**That image has the original Code 10 failure and does not contain the WIP fixes.**
+The candidate image is `evidence/s3dongle-wip-windows-2026-10-24.bin`; it has never
+been flashed. See the investigation for the separate manifests and test results.
+The following command is only a recovery/reference example for the old image:
 
 ```powershell
 python -m pip install esptool
@@ -41,6 +46,20 @@ python -m esptool --chip esp32s3 --port COM13 write-flash 0 evidence/s3dongle-me
 
 Merged image SHA-256:
 `f36616837c199f118f261be217a599542005767fc0afe18514daf9aea4f98da1`.
+
+## Tests without hardware
+
+From `BLE/`:
+
+```powershell
+./tests/run-host-tests.ps1
+# In the activated ESP-IDF environment, after building:
+python tests/check-built-descriptors.py
+```
+
+Host tests compile the actual transport C code against deterministic USB/FreeRTOS
+mocks. The second check reads the actual target ELF descriptors and preprocesses
+TinyUSB with its build flags. Neither test opens COM13 or any USB device.
 
 ## Recovery and restoring the original firmware
 

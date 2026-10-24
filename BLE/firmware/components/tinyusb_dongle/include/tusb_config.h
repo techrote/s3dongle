@@ -127,6 +127,10 @@ extern "C" {
 // Number of BTH ISO alternatives
 #define CFG_TUD_BTH_ISO_ALT_COUNT   CONFIG_TINYUSB_BTH_ISO_ALT_COUNT
 
+// Bluetooth Core USB transport section 2.2: accept historical device-addressed
+// HCI requests (bRequest=0xE0) as well as the standard bRequest=0x00 form.
+#define CFG_TUD_BTH_HISTORICAL_COMPATIBLE 1
+
 // Enabled device class driver
 #define CFG_TUD_CDC                 CONFIG_TINYUSB_CDC_COUNT
 #define CFG_TUD_CUSTOM_CLASS        CONFIG_TINYUSB_CUSTOM_CLASS_ENABLED
