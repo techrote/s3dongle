@@ -143,6 +143,7 @@ enum {
 
 #if CFG_TUD_BTH
     ITF_NUM_BTH,
+    ITF_NUM_BTH_VOICE, // TUD_BTH_DESCRIPTOR emits primary AND voice interfaces.
 #endif
 
 #if CFG_TUD_DFU
@@ -251,7 +252,8 @@ uint8_t const descriptor_fs_cfg_default[] = {
 #if CFG_TUD_BTH
     // BT Primary controller descriptor
     // Interface number, string index, attributes, event endpoint, event endpoint size, interval, data in, data out, data endpoint size, iso endpoint sizes
-    TUD_BTH_DESCRIPTOR(ITF_NUM_BTH, STRID_BTH_INTERFACE, (0x80 | EPNUM_BT_EVT), 16, 1, (0x80 | EPNUM_BT_BULK_OUT), EPNUM_BT_BULK_OUT, 64, 64, 64),
+    // BLE has no SCO voice transport. Alternate zero must reserve zero bandwidth.
+    TUD_BTH_DESCRIPTOR(ITF_NUM_BTH, STRID_BTH_INTERFACE, (0x80 | EPNUM_BT_EVT), 16, 1, (0x80 | EPNUM_BT_BULK_OUT), EPNUM_BT_BULK_OUT, 64, 0),
 #endif
 
 #if CFG_TUD_DFU
@@ -294,7 +296,7 @@ uint8_t const descriptor_hs_cfg_default[] = {
 #if CFG_TUD_BTH
     // BT Primary controller descriptor
     // Interface number, string index, attributes, event endpoint, event endpoint size, interval, data in, data out, data endpoint size, iso endpoint sizes
-    TUD_BTH_DESCRIPTOR(ITF_NUM_BTH, STRID_BTH_INTERFACE, (0x80 | EPNUM_BT_EVT), 16, 1, (0x80 | EPNUM_BT_BULK_OUT), EPNUM_BT_BULK_OUT, 512, 1024, 1024),
+    TUD_BTH_DESCRIPTOR(ITF_NUM_BTH, STRID_BTH_INTERFACE, (0x80 | EPNUM_BT_EVT), 16, 1, (0x80 | EPNUM_BT_BULK_OUT), EPNUM_BT_BULK_OUT, 512, 0),
 #endif
 
 #if CFG_TUD_DFU

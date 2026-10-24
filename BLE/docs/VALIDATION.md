@@ -3,6 +3,10 @@
 Project files now live under `BLE/`. Paths below are relative to that folder.
 Captured build/flash logs retain their original paths as historical evidence.
 
+This document describes the **old firmware tested on hardware on 23 October**.
+The unflashed 24 October WIP candidate is documented separately in
+[WINDOWS_CODE10_WIP.md](WINDOWS_CODE10_WIP.md). Its build/tests do not change these results.
+
 ## Result
 
 Firmware built and flashed successfully. The board enumerates as a USB Bluetooth
